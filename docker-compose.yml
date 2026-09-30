@@ -1,0 +1,83 @@
+x-app: &app
+  build: .
+  image: dodo-invoice-service:local
+  restart: unless-stopped
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: invoices
+      POSTGRES_PASSWORD: invoices
+      POSTGRES_DB: invoices
+    ports:
+      # 5433 on the host so a locally installed Postgres on 5432 does not clash.
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U invoices -d invoices"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  mock-psp:
+    <<: *app
+    command: ["mock-psp"]
+    environment:
+      MOCK_PSP_ADDR: 0.0.0.0:9090
+      MOCK_PSP_LATENCY_MS: "100"
+      MOCK_PSP_TIMEOUT_DELAY_MS: "30000"
+      RUST_LOG: info
+    ports:
+      - "9090:9090"
+
+  webhook-sink:
+    <<: *app
+    command: ["webhook-sink"]
+    environment:
+      WEBHOOK_SINK_ADDR: 0.0.0.0:9100
+      RUST_LOG: info
+    ports:
+      - "9100:9100"
+
+  api:
+    <<: *app
+    command: ["invoice-service", "serve"]
+    environment:
+      DATABASE_URL: postgres://invoices:invoices@db:5432/invoices
+      LISTEN_ADDR: 0.0.0.0:8080
+      PSP_BASE_URL: http://mock-psp:9090
+      PSP_TIMEOUT_MS: "5000"
+      RUST_LOG: info,sqlx=warn
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+      mock-psp:
+        condition: service_started
+      webhook-sink:
+        condition: service_started
+
+  # Not started by `docker compose up`. Runs the test suite without a local
+  # Rust toolchain:  docker compose --profile test run --rm tests
+  tests:
+    image: rust:1.93-slim-bookworm
+    profiles: ["test"]
+    working_dir: /src
+    command: ["cargo", "test", "--locked"]
+    environment:
+      DATABASE_URL: postgres://invoices:invoices@db:5432/invoices
+    volumes:
+      - .:/src
+      - cargo-registry:/usr/local/cargo/registry
+      - test-target:/src/target
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  cargo-registry:
+  test-target:
